@@ -1,526 +1,302 @@
-import os
-import numpy as np
-import pandas as pd
-
-# --- CONFIGURATION ---
-PATIENT_ID = 'Patient-1'
-SEGMENTS_DIR = '/kaggle/input/patient-1-30seconds/Patient_1'
-ANNOTATION_CSV = '/kaggle/input/patient-1-30seconds/chb1_segments.csv'
-
-# 1. Load annotation DataFrame
-ann_df = pd.read_csv(ANNOTATION_CSV)
-
-# 2. Prepare a list to collect data
-data = []
-
-# 3. Loop over all segmented files for this patient
-for seg_file in sorted(os.listdir(SEGMENTS_DIR)):
-    if not (seg_file.endswith('.npy')):
-        continue
-    seg_path = os.path.join(SEGMENTS_DIR, seg_file)
-    segments = np.load(seg_path, mmap_mode='r')  # don't load into memory
-
-    # Adjust file name for looking up in annotation DataFrame
-    base_seg_file = seg_file.replace('_stft_30sec.npy', '_segmented.npy')
-    file_ann = ann_df[ann_df['filename'] == base_seg_file]
-
-    for _, row in file_ann.iterrows():
-        seg_idx = int(row['segment'])
-        label = int(row['segment_label'])
-        if seg_idx >= len(segments):
-            continue
-        data.append({
-            'filename': seg_file,
-            'segment_idx': seg_idx,
-            'label': label,
-            'file_path': seg_path  # store path only
-        })
-
-# 4. Convert to DataFrame
-df_segments = pd.DataFrame(data)
-
-print(f"Stored {len(df_segments)} labeled segment references for {PATIENT_ID}.")
-
-import pandas as pd
-import numpy as np # Ensure numpy is imported for rng in get_loso_folds
-
-def process_segments(df_raw, preictal_threshold=200):
-    """
-    Filters the raw DataFrame to include only 'interictal' (0) and 'preictal' (1) segments.
-    Identifies files that have enough preictal segments to serve as LOSO validation/test folds.
-
-    Args:
-        df_raw (pd.DataFrame): DataFrame with raw segment labels (0, 1, 2, 3, 4).
-                               Expected columns: 'filename', 'label', etc.
-        preictal_threshold (int): Minimum number of preictal segments a file must have
-                                  to be considered a candidate for a LOSO validation/test fold.
-
-    Returns:
-        tuple:
-            - cleaned_df (pd.DataFrame): DataFrame containing only interictal (0) and preictal (1) segments.
-                                         This is the full pool of data for the patient.
-            - loso_candidate_files (list): List of filenames that qualify to be held out as a
-                                           validation/test set in a LOSO fold (i.e., contain >= preictal_threshold preictal segments).
-    """
-    # Step 1: Remove unwanted labels (ictal=2, postictal=3, grey=4)
-    # This creates the universal pool of usable segments (interictal and preictal) for the patient.
-    cleaned_df = df_raw[~df_raw['label'].isin([2, 3, 4])].reset_index(drop=True)
-
-    # Step 2: Identify files that have enough preictal (label=1) segments
-    # These are the candidates for being the held-out file in a LOSO fold.
-    preictal_df_only = cleaned_df[cleaned_df['label'] == 1]
-    preictal_counts = preictal_df_only['filename'].value_counts()
-
-    # Files that meet the threshold to be a LOSO validation/test fold
-    loso_candidate_files = preictal_counts[preictal_counts >= preictal_threshold].index.tolist()
-
-    # IMPORTANT: The 'cleaned_df' is your full pool.
-    # The 'loso_candidate_files' only dictates WHICH files can be held out as a test fold.
-    # Segments from files NOT in 'loso_candidate_files' will always be part of the training set
-    # for any given fold.
-
-    print(f"Total usable segments (interictal/preictal): {len(cleaned_df)}")
-    print(f"Files qualifying as LOSO validation/test candidates (>= {preictal_threshold} preictal segments): {len(loso_candidate_files)}")
-    if not loso_candidate_files:
-        print("WARNING: No files met the preictal threshold to form LOSO folds. Check your data or threshold.")
-
-    return cleaned_df, loso_candidate_files
-
-cleaned_df, loso_candidate_files = process_segments(df_segments, preictal_threshold=40)
-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import random
-import gc
-from sklearn.metrics import accuracy_score, recall_score, precision_score, roc_auc_score, brier_score_loss, f1_score
-import time
 import pandas as pd
+import random
 import os
-import math # Needed for CosineAnnealingLR T_max calculation
-from torchvision import models # Needed for torchvision.models.vit_b_16
+import gc
+import time
+import sys
+from sklearn.metrics import (accuracy_score, recall_score, precision_score, 
+                             roc_auc_score, f1_score)
 
-# --- EEGHybridViT Model Definition (Consolidated from your previous code) ---
-class EEGHybridViT(nn.Module):
-    def __init__(self, num_eeg_channels=22, num_classes=2):
-        super().__init__()
-        # Multi-layer convolutional feature extractor (adapts input channels to 3)
-        # Assuming input spectrograms are approx 224x224 and conv_layers maintains spatial dims.
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(num_eeg_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 3, kernel_size=3, padding=1),  # Reduce to 3 channels
-            nn.BatchNorm2d(3),
-            nn.ReLU()
-        )
-        
-        # Pretrained ViT (vit_b_16 expects 224x224 input)
-        self.vit = models.vit_b_16(pretrained=True)
-        
-        # Classifier head: 2 dense layers, replacing the original ViT head
-        # Dropout adjusted here to 0.3 for consistency with previous aggressive settings
-        self.vit.heads.head = nn.Sequential(
-            nn.Linear(self.vit.heads.head.in_features, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3), # Using 0.3 for classifier dropout
-            nn.Linear(256, num_classes)
-        )
+# --- CONFIGURATION & CONSTANTS ---
+# A longer training window to ensure convergence for difficult folds
+SYNC_EPOCHS = 100
+MIN_EPOCHS_BEFORE_STOP = 40
+PATIENCE = 20
+# A more balanced data signal to promote stability
+UNDERSAMPLE_RATIO = 2.5 
+BATCH_SIZE = 64
+RANDOM_STATE = 42
+FIXED_THRESHOLD = 0.5
+MODEL_SAVE_DIR = "/kaggle/working/models/"
+RESULTS_SAVE_PATH = "/kaggle/working/final_definitive_results.csv"
 
-    def forward(self, x):
-        # x is (batch, num_eeg_channels, H, W) e.g., (batch, 22, 257, 225) after STFT
-        x = self.conv_layers(x)  # Output: (batch, 3, H, W) where H, W are maintained due to padding=1 and no pooling.
-        
-        # Interpolate to 224x224 for the pretrained ViT input
-        x = nn.functional.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
-        return self.vit(x)
+# --- HELPER CLASSES AND FUNCTIONS ---
 
-# --- END EEGHybridViT Model Definition ---
+def seed_everything(seed=RANDOM_STATE):
+    """Sets random seeds for reproducibility."""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+class FocalLoss(nn.Module):
+    """
+    The one crucial tweak: a biased Focal Loss (alpha=0.75) to provide a stable 
+    incentive for detecting the minority (seizure) class.
+    """
+    def __init__(self, alpha=0.65, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
 
-# ---- Simple Dataset for Precomputed Spectrograms (kept as provided) ----
-class EEGSegmentDataset(torch.utils.data.Dataset):
+    def forward(self, logits, targets):
+        ce_loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
+        pt = torch.exp(-ce_loss)
+        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha).to(logits.device)
+        focal_loss = alpha_t * (1 - pt)**self.gamma * ce_loss
+        return focal_loss.mean()
+
+class EEGSegmentDataset(Dataset):
+    """Dataset class for loading EEG spectrogram segments."""
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
     def __len__(self):
         return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        file_path = row['file_path']
-        segment_idx = row['segment_idx']
-        label = int(row['label'])
-        spectro = np.load(file_path, mmap_mode='r')[segment_idx]
-        spectro_tensor = torch.tensor(spectro, dtype=torch.float32)
-        label_tensor = torch.tensor(label, dtype=torch.long)
-        return spectro_tensor, label_tensor
+        spectro = np.load(row['file_path'], mmap_mode='r')[row['segment_idx']]
+        return torch.tensor(spectro, dtype=torch.float32), torch.tensor(int(row['label']), dtype=torch.long)
 
-# --- Random undersampling function (kept as provided) ---
-def random_undersample(df, label_col='label', majority_class=0, minority_class=1, random_state=42, ratio=1.0):
-    df_majority = df[df[label_col] == majority_class]
-    df_minority = df[df[label_col] == minority_class]
-    n_majority = int(len(df_minority) * ratio)
-    df_majority_downsampled = df_majority.sample(n=min(n_majority, len(df_majority)), random_state=random_state)
-    df_balanced = pd.concat([df_majority_downsampled, df_minority])
-    df_balanced = df_balanced.sample(frac=1, random_state=random_state).reset_index(drop=True)
-    return df_balanced
+class DeeperCNN_BiLSTM(nn.Module):
+    """
+    The main model architecture, using moderate dropout values from the original
+    stable pipeline.
+    """
+    def __init__(self, num_eeg_channels=22, num_classes=2, 
+                 conv_dropout=0.4, lstm_dropout=0.5, classifier_dropout=0.5):
+        super(DeeperCNN_BiLSTM, self).__init__()
+        self.conv_block1 = self._create_conv_block(num_eeg_channels, 32, conv_dropout)
+        self.conv_block2 = self._create_conv_block(32, 64, conv_dropout)
+        self.conv_block3 = self._create_conv_block(64, 128, conv_dropout)
+        self.conv_block4 = self._create_conv_block(128, 256, conv_dropout, pool=False)
+        
+        final_conv_height = 112 // (2**3) 
+        self.lstm_input_features = 256 * final_conv_height
+        
+        self.lstm = nn.LSTM(
+            input_size=self.lstm_input_features, hidden_size=256, num_layers=2, 
+            batch_first=True, bidirectional=True, dropout=lstm_dropout
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * 256, 128), nn.ReLU(),
+            nn.Dropout(classifier_dropout),
+            nn.Linear(128, num_classes)
+        )
+    def _create_conv_block(self, in_channels, out_channels, dropout_rate, pool=True):
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels), nn.ReLU()
+        ]
+        if pool:
+            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        layers.append(nn.Dropout(dropout_rate))
+        return nn.Sequential(*layers)
+    def forward(self, x):
+        x = self.conv_block1(x); x = self.conv_block2(x); x = self.conv_block3(x); x = self.conv_block4(x)
+        x = x.permute(0, 3, 1, 2); x = x.reshape(x.size(0), x.size(1), -1)
+        _, (h_n, _) = self.lstm(x)
+        final_hidden_state = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
+        return self.classifier(final_hidden_state)
 
-# --- augment_batch function (as provided) ---
-def augment_batch(batch_spectrograms, p_augment=0.5, 
-                  mag_scale_range=(0.9, 1.1),
-                  freq_mask_max_ratio=0.1, time_mask_max_ratio=0.1,
-                  device='cuda'):
-    augmented_batch = batch_spectrograms.clone().to(device)
-    batch_size, num_channels, H, W = augmented_batch.shape
-    for i in range(batch_size):
-        if random.random() < p_augment:
-            spectrogram = augmented_batch[i]
-            scale_factor = random.uniform(mag_scale_range[0], mag_scale_range[1])
-            spectrogram = spectrogram * scale_factor
-            if random.random() < 0.5:
-                num_masked_freq_bins = int(H * random.uniform(0.0, freq_mask_max_ratio))
-                if num_masked_freq_bins > 0:
-                    start_freq_bin = random.randint(0, H - num_masked_freq_bins)
-                    spectrogram[:, start_freq_bin : start_freq_bin + num_masked_freq_bins, :] = 0.0
-            if random.random() < 0.5:
-                num_masked_time_bins = int(W * random.uniform(0.0, time_mask_max_ratio))
-                if num_masked_time_bins > 0:
-                    start_time_bin = random.randint(0, W - num_masked_time_bins)
-                    spectrogram[:, :, start_time_bin : start_time_bin + num_masked_time_bins] = 0.0
-            augmented_batch[i] = spectrogram
-    return augmented_batch
-
-# --- CORRECTED get_loso_folds function (as provided) ---
-def get_loso_folds(cleaned_df, loso_candidate_files, interictal_val_ratio=0.2, random_state=42):
+def get_loso_session_folds(main_df, session_map):
+    """Creates training and testing folds based on a Leave-One-Session-Out strategy."""
     folds = []
-    rng = np.random.RandomState(random_state)
-    all_preictal_segments = cleaned_df[cleaned_df['label'] == 1]
-    all_interictal_segments = cleaned_df[cleaned_df['label'] == 0]
-    all_interictal_filenames = all_interictal_segments['filename'].unique().tolist()
-    rng.shuffle(all_interictal_filenames)
-    num_interictal_val_files = max(1, int(len(all_interictal_filenames) * interictal_val_ratio))
-    global_interictal_val_filenames = all_interictal_filenames[:num_interictal_val_files]
-    global_interictal_train_filenames = all_interictal_filenames[num_interictal_val_files:]
-    shuffled_loso_candidate_files = list(loso_candidate_files)
-    rng.shuffle(shuffled_loso_candidate_files)
-    if not shuffled_loso_candidate_files:
-        print("No LOSO candidate files found. Cannot create preictal-focused folds.")
-        return []
-    for held_out_filename_preictal in shuffled_loso_candidate_files:
-        val_preictal_part = all_preictal_segments[all_preictal_segments['filename'] == held_out_filename_preictal]
-        val_interictal_part = all_interictal_segments[
-            all_interictal_segments['filename'].isin(global_interictal_val_filenames)
-        ]
-        val_df = pd.concat([val_preictal_part, val_interictal_part]).reset_index(drop=True)
-        train_preictal_part = all_preictal_segments[
-            all_preictal_segments['filename'] != held_out_filename_preictal
-        ]
-        train_interictal_part = all_interictal_segments[
-            all_interictal_segments['filename'].isin(global_interictal_train_filenames)
-        ]
-        train_df = pd.concat([train_preictal_part, train_interictal_part]).reset_index(drop=True)
-        train_preictal_count = len(train_df[train_df['label'] == 1])
-        train_interictal_count = len(train_df[train_df['label'] == 0])
-        val_preictal_count = len(val_df[val_df['label'] == 1])
-        val_interictal_count = len(val_df[val_df['label'] == 0])
-        print(f"\n--- Fold for test file: {held_out_filename_preictal} ---")
-        print(f"Train Segments: {len(train_df)} (Preictal: {train_preictal_count}, Interictal: {train_interictal_count})")
-        print(f"Validation Segments: {len(val_df)} (Preictal: {val_preictal_count}, Interictal: {val_interictal_count})")
-        if val_preictal_count == 0 or val_interictal_count == 0:
-            print(f"WARNING: Validation set for this fold is missing a class! Preictal: {val_preictal_count}, Interictal: {val_interictal_count}. Some metrics might be NaN or misleading.")
-        folds.append((train_df, val_df, held_out_filename_preictal))
+    curated_preictal_files = list(session_map.keys())
+    for held_out_preictal_file, held_out_interictal_buddies in session_map.items():
+        held_out_session_files = [held_out_preictal_file] + held_out_interictal_buddies
+        test_df = main_df[main_df['file_name'].isin(held_out_session_files)].reset_index(drop=True)
+        
+        train_preictal_filenames = [f for f in curated_preictal_files if f != held_out_preictal_file]
+        train_preictal_df = main_df[main_df['file_name'].isin(train_preictal_filenames)]
+        
+        all_interictal_df = main_df[main_df['label'] == 0]
+        train_interictal_df = all_interictal_df[~all_interictal_df['file_name'].isin(held_out_session_files)]
+        
+        train_df = pd.concat([train_preictal_df, train_interictal_df]).sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+        
+        if len(test_df) == 0 or len(test_df[test_df['label']==1]) == 0:
+            print(f"Skipping fold for {held_out_preictal_file} due to no test samples or no positive labels in test set.")
+            continue
+            
+        folds.append((train_df, test_df, held_out_preictal_file))
     return folds
 
-# --- Main training function (with all corrections and consolidations) ---
-def train_patient_model(
-    train_df,
-    val_df,
-    model, # This model instance is now passed in and expected to be newly initialized per fold
-    batch_size=8,
-    num_epochs=100,
-    patience=15, # Consolidated patience
-    lr=5e-5,     # Consolidated learning rate
-    undersample=True,
-    undersample_ratio=1.0, # Consolidated undersample ratio to 1.0 for 1:1 balance
-    augmenter=None, # Placeholder, augment_batch is called directly
-    accumulation_steps=4, # Assuming this is passed from main loop
-    model_path="/kaggle/working/best_model.pt" # This path MUST be unique per fold
-):
+
+class SeizurePredictionPipeline:
+    def __init__(self, model_class, model_params, optimizer_params, device):
+        self.model_class = model_class
+        self.model_params = model_params
+        self.optimizer_params = optimizer_params
+        self.device = device
+
+    def train_model(self, train_df, val_df, model_path):
+        model = self.model_class(**self.model_params).to(self.device)
+        optimizer = torch.optim.SGD(model.parameters(), **self.optimizer_params)
+        
+        train_balanced_df = self._random_undersample(train_df, ratio=UNDERSAMPLE_RATIO)
+        print(f"  Training data balanced. Seizure samples: {len(train_balanced_df[train_balanced_df['label']==1])}, Non-seizure samples: {len(train_balanced_df[train_balanced_df['label']==0])}")
+        train_loader = DataLoader(EEGSegmentDataset(train_balanced_df), batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+        val_loader = DataLoader(EEGSegmentDataset(val_df), batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SYNC_EPOCHS)
+        criterion = FocalLoss().to(self.device)
+        
+        best_score, patience_counter = -1.0, 0
+        print(f"  Starting training for up to {SYNC_EPOCHS} epochs...")
+        for epoch in range(SYNC_EPOCHS):
+            model.train(); epoch_start_time = time.time(); total_train_loss = 0
+            
+            for i, (xb, yb) in enumerate(train_loader):
+                xb, yb = xb.to(self.device), yb.to(self.device)
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_train_loss += loss.item() * xb.size(0)
+            
+            scheduler.step()
+
+            avg_train_loss = total_train_loss / len(train_loader.dataset)
+            val_probs, val_labels, avg_val_loss = self._get_predictions_and_loss(model, val_loader, criterion)
+            
+            val_preds = (val_probs[:, 1] > FIXED_THRESHOLD).astype(int)
+            val_auc = roc_auc_score(val_labels, val_probs[:, 1]) if len(np.unique(val_labels)) > 1 else 0.5
+            val_f1_binary = f1_score(val_labels, val_preds, pos_label=1, zero_division=0)
+            
+            # The definitive saving metric: rewards both AUC and F1 for the seizure class.
+            composite_score = 0.7 * val_auc + 0.3 * val_f1_binary
+            sensitivity = recall_score(val_labels, val_preds, pos_label=1, zero_division=0)
+            
+            epoch_time = time.time() - epoch_start_time
+            sys.stdout.write('\r' + ' ' * 80 + '\r'); sys.stdout.flush()
+            print(f"  Epoch {epoch+1}/{SYNC_EPOCHS} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val AUC: {val_auc:.4f} | Val F1 (S): {val_f1_binary:.4f} | Sensitivity: {sensitivity:.4f} | Composite: {composite_score:.4f} | Time: {epoch_time:.1f}s")
+            
+            if composite_score > best_score:
+                best_score = composite_score; patience_counter = 0
+                torch.save(model.state_dict(), model_path)
+                print(f"    -> Model saved to {model_path} (New best score: {best_score:.4f})")
+            else:
+                patience_counter += 1
+            if epoch >= MIN_EPOCHS_BEFORE_STOP and patience_counter >= PATIENCE:
+                print(f"  Early stopping triggered at epoch {epoch+1}.")
+                break
+        
+        if os.path.exists(model_path):
+            model.load_state_dict(torch.load(model_path))
+        return model
+
+    def _get_predictions_and_loss(self, model, data_loader, criterion):
+        model.eval()
+        all_probs, all_labels, total_val_loss = [], [], 0
+        with torch.no_grad():
+            for xb, yb in data_loader:
+                xb_dev, yb_dev = xb.to(self.device), yb.to(self.device)
+                logits = model(xb_dev)
+                loss = criterion(logits, yb_dev)
+                total_val_loss += loss.item() * xb.size(0)
+                all_probs.append(torch.softmax(logits, dim=1).cpu().numpy())
+                all_labels.append(yb.cpu().numpy())
+        avg_loss = total_val_loss / len(data_loader.dataset) if len(data_loader.dataset) > 0 else 0
+        return np.vstack(all_probs), np.concatenate(all_labels), avg_loss
+    
+    def _random_undersample(self, df, ratio, random_state=RANDOM_STATE):
+        minority = df[df['label'] == 1]
+        majority = df[df['label'] == 0]
+        n_majority = int(len(minority) * ratio)
+        if n_majority > len(majority): n_majority = len(majority)
+        majority_downsampled = majority.sample(n=n_majority, random_state=random_state)
+        return pd.concat([minority, majority_downsampled]).sample(frac=1, random_state=random_state)
+
+def evaluate_with_threshold(y_true, y_probs, threshold):
+    """Calculates key metrics for a given threshold."""
+    y_pred = (y_probs > threshold).astype(int)
+    false_positives = np.sum((y_pred == 1) & (y_true == 0))
+    interictal_segments = np.sum(y_true == 0)
+    
+    interictal_hours = (interictal_segments * 30.0) / 3600.0
+    fph = false_positives / interictal_hours if interictal_hours > 0 else 0.0
+    
+    return {
+        'accuracy': accuracy_score(y_true, y_pred),
+        'f1_score_macro': f1_score(y_true, y_pred, average='macro', zero_division=0),
+        'f1_score_binary': f1_score(y_true, y_pred, pos_label=1, zero_division=0),
+        'sensitivity': recall_score(y_true, y_pred, pos_label=1, zero_division=0),
+        'precision': precision_score(y_true, y_pred, pos_label=1, zero_division=0),
+        'specificity': recall_score(y_true, y_pred, pos_label=0, zero_division=0),
+        'fph': fph,
+        'auc_roc': roc_auc_score(y_true, y_probs) if len(np.unique(y_true)) > 1 else 0.5,
+        'threshold': threshold
+    }
+
+if __name__ == '__main__':
+    seed_everything()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
-    if device.type == 'cuda':
-        torch.cuda.manual_seed(42)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    # NOTE: Assume `cleaned_df` and `session_map` are pre-loaded.
+    
+    folds = get_loso_session_folds(cleaned_df, session_map)
+    all_final_metrics = []
+    
+    os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 
-    if undersample:
-        train_df = random_undersample(
-            train_df,
-            label_col='label',
-            majority_class=0,
-            minority_class=1,
-            random_state=42,
-            ratio=undersample_ratio # Use consolidated ratio
+    # Returning to the stable, moderately-regularized model parameters
+    model_params = {'num_eeg_channels': 22, 'num_classes': 2, 'conv_dropout': 0.4, 'lstm_dropout': 0.5, 'classifier_dropout': 0.5}
+    # Using a conservative learning rate to ensure stable learning
+    optimizer_params = {'lr': 1e-3, 'momentum': 0.9, 'weight_decay': 5e-4}
+    
+    for i, (train_df, test_df, held_out_file) in enumerate(folds):
+        fold_id = i + 1
+        print(f"\n{'='*50}\nSTARTING FOLD {fold_id}/{len(folds)}\n{'='*50}")
+        print(f"Held-out session for validation: {held_out_file}")
+        
+        pipeline = SeizurePredictionPipeline(DeeperCNN_BiLSTM, model_params, optimizer_params, device)
+        model_path = os.path.join(MODEL_SAVE_DIR, f"loso_model_fold_{fold_id}.pt")
+        
+        model = pipeline.train_model(train_df, test_df, model_path)
+        
+        print(f"\n--- Evaluating Fold {fold_id} with best model... ---")
+        fold_probs, fold_labels, _ = pipeline._get_predictions_and_loss(
+            model, DataLoader(EEGSegmentDataset(test_df), batch_size=BATCH_SIZE*2), nn.CrossEntropyLoss()
         )
-        print(f"Train samples after undersampling: {len(train_df)}")
-        print("Train class counts after undersampling:", train_df['label'].value_counts().to_dict())
-            
-    print(f"Train_df labels: {train_df['label'].unique()}, Val_df labels: {val_df['label'].unique()}")
-    
-    if len(train_df) == 0:
-        print("WARNING: Training DataFrame is empty. Skipping fold evaluation.")
-        return {'best_val_f1': float('nan')}
-    if len(val_df) == 0:
-        print("WARNING: Validation DataFrame is empty. All validation metrics will be NaN.")
-
-    train_dataset = EEGSegmentDataset(train_df)
-    val_dataset = EEGSegmentDataset(val_df)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
-
-    model = model.to(device)
-    for param in model.parameters():
-        param.requires_grad = True
-
-    num_classes = 2
-    class_counts = train_df['label'].value_counts().reindex(range(num_classes), fill_value=0)
-    safe_class_counts = class_counts.replace(0, 1e-6)
-    
-    weights = 1.0 / safe_class_counts # Using inverse frequency (no sqrt/boost) as in high-acc code
-    weights = weights / weights.sum() # Normalize to sum to 1
-    class_weights_tensor = torch.tensor(weights.values, dtype=torch.float32).to(device)
-
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01) # Consolidated weight_decay
-    
-    # --- Cosine Annealing LR Scheduler ---
-    T_max_scheduler = num_epochs * (len(train_loader) // accumulation_steps) # Number of optimizer steps
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max_scheduler, eta_min=1e-6)
-    # -------------------------------------
-    
-    grad_clip = 1.0
-
-    print("Class weights:", class_weights_tensor.cpu().numpy().tolist())
-    print(f"DEBUG: Accumulation steps received: {accumulation_steps}") # Keep this debug print
-
-    best_f1 = -1.0
-    best_val_loss = np.inf
-    patience_counter = 0
-
-    for epoch in range(num_epochs):
-        start_time = time.time()
-        model.train()
-        train_loss = 0
         
-        optimizer.zero_grad() # Zero gradients at the start of each accumulation cycle / epoch
-
-        for i, (xb, yb) in enumerate(train_loader):
-            xb, yb = xb.to(device), yb.to(device)
-            
-            # Apply Augmentation
-            xb = augment_batch(xb, p_augment=0.95, # Aggressive p_augment
-                               mag_scale_range=(0.7, 1.3),
-                               freq_mask_max_ratio=0.3, # Aggressive masking
-                               time_mask_max_ratio=0.3, # Aggressive masking
-                               device=device)
-            
-            assert not torch.isnan(xb).any() and not torch.isinf(xb).any(), "NaN/Inf in xb"
-            
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            
-            loss = loss / accumulation_steps # Scale loss
-            loss.backward() # Accumulate gradients
-            
-            if (i + 1) % accumulation_steps == 0: # Execute optimizer step only after accumulation
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip) # Clip accumulated gradients
-                optimizer.step() # Update weights
-                scheduler.step() # Call scheduler.step() after optimizer.step()
-                optimizer.zero_grad() # Clear gradients for the next accumulation cycle
-            
-            train_loss += loss.item() * xb.size(0) * accumulation_steps
-            
-            del xb, yb, logits, loss
-            torch.cuda.empty_cache()
-            
-            elapsed = time.time() - start_time
-            batches_done = i + 1
-            batches_left = len(train_loader) - batches_done
-            time_per_batch = elapsed / batches_done
-            est_time_left = time_per_batch * batches_left
-            print(f"Epoch {epoch+1}/{num_epochs} | Batch {batches_done}/{len(train_loader)} - Estimated time left: {est_time_left:.1f} seconds", end='\r')
+        fold_metrics = evaluate_with_threshold(fold_labels, fold_probs[:, 1], FIXED_THRESHOLD)
+        print(f"  -> Fold Metrics (Threshold = {FIXED_THRESHOLD}):")
+        print(f"     Accuracy:        {fold_metrics['accuracy']:.4f}")
+        print(f"     F1-Score (Macro):{fold_metrics['f1_score_macro']:.4f}")
+        print(f"     F1-Score (S):    {fold_metrics['f1_score_binary']:.4f}")
+        print(f"     Sensitivity:     {fold_metrics['sensitivity']:.4f}")
+        print(f"     Precision:       {fold_metrics['precision']:.4f}")
+        print(f"     FPH:             {fold_metrics['fph']:.4f}")
+        print(f"     AUC:             {fold_metrics['auc_roc']:.4f}")
         
-        # --- Handle remaining gradients if the last batch was not a multiple of accumulation_steps ---
-        if (i + 1) % accumulation_steps != 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            scheduler.step() # Call scheduler.step() for the final step
-            optimizer.zero_grad()
-        # ---------------------------------------------------------------------------------------
+        fold_metrics['fold'] = fold_id
+        fold_metrics['held_out_file'] = held_out_file
+        all_final_metrics.append(fold_metrics)
 
-        train_loss /= len(train_loader.dataset)
-        print() # For a clean new line after the batch progress output
-        
-        # ... (rest of validation and early stopping logic) ...
-        model.eval()
-        val_loss = 0
-        all_logits, all_labels = [], []
-        with torch.no_grad():
-            if len(val_loader.dataset) > 0:
-                for xb, yb in val_loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    logits = model(xb)
-                    loss = criterion(logits, yb)
-                    val_loss += loss.item() * xb.size(0)
-                    all_logits.append(logits.cpu())
-                    all_labels.append(yb.cpu())
-                    del xb, yb, logits, loss
-                    torch.cuda.empty_cache()
-                val_loss /= len(val_loader.dataset)
-            else:
-                val_loss = float('nan')
-                
-        if len(all_labels) == 0:
-            print("WARNING: Validation set was entirely empty. All metrics will be NaN.")
-            val_f1 = val_acc = brier = val_auc = float('nan')
-            val_recall = val_precision = np.array([float('nan'), float('nan')])
-        else:
-            all_logits = torch.cat(all_logits)
-            all_labels = torch.cat(all_labels)
-            probs = torch.softmax(all_logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
+        del model, pipeline; gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-            unique_labels_val = all_labels.unique()
-            if len(unique_labels_val) < 2:
-                print(f"WARNING: Validation set only contains {len(unique_labels_val)} unique label(s). Some metrics might be NaN or misleading.")
-                val_f1 = val_acc = brier = val_auc = float('nan')
-                val_recall = val_precision = np.array([float('nan'), float('nan')])
-            else:
-                val_f1 = f1_score(all_labels, preds, average='macro', zero_division=0)
-                val_acc = accuracy_score(all_labels, preds)
-                val_recall = recall_score(all_labels, preds, average=None, zero_division=0)
-                val_precision = precision_score(all_labels, preds, average=None, zero_division=0)
-                
-                brier = np.mean([brier_score_loss((all_labels.numpy() == c).astype(int), probs[:, c].numpy()) for c in range(probs.shape[1])])
-                try:
-                    val_auc = roc_auc_score(all_labels, probs[:, 1].numpy())
-                except ValueError as e:
-                    print(f"WARNING: Could not calculate AUC: {e}. Likely only one class predicted or present in relevant labels.")
-                    val_auc = float('nan')
-
-        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-              f"Val F1: {val_f1:.4f} | Val Acc: {val_acc:.4f} | "
-              f"Val Recall: {val_recall} | Val Precision: {val_precision} | "
-              f"Brier: {brier:.4f} | Val AUC: {val_auc:.4f}")
-
-        # Note: Cosine Annealing does not typically require scheduler.step(val_loss)
-        # However, for early stopping (patience_counter), you still track val_loss.
-        if not np.isnan(val_loss) and val_loss <= best_val_loss:
-            best_val_loss = val_loss
-            best_f1 = val_f1
-            patience_counter = 0
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            torch.save(model.state_dict(), model_path)
-            print(f"Model saved with improved Val Loss: {val_loss:.4f}")
-        else:
-            patience_counter += 1
-            if patience_counter > patience:
-                print("Early stopping triggered.")
-                break
-
-    print("Training complete for this fold.")
-    try:
-        model.load_state_dict(torch.load(model_path))
-    except FileNotFoundError:
-        print(f"WARNING: Best model not saved at {model_path} during training. Returning metrics from last epoch.")
-        
-    metrics = {'best_val_f1': best_f1,
-               'final_val_loss': val_loss,
-               'final_val_acc': val_acc,
-               'final_val_recall': val_recall.tolist(),
-               'final_val_precision': val_precision.tolist(),
-               'final_brier': brier,
-               'final_val_auc': val_auc}
+    results_df = pd.DataFrame(all_final_metrics)
     
-    del model, train_loader, val_loader, train_dataset, val_dataset
-    torch.cuda.empty_cache()
-    gc.collect()
+    print(f"\n{'='*50}\nFINAL RESULTS\n{'='*50}")
     
-    return metrics
-
-
-# --- Main execution loop for cross-validation ---
-# This block assumes 'cleaned_df' and 'loso_candidate_files' are already defined
-# and correctly populated before this script runs.
-
-# The 'model' variable here is just a placeholder for the initial instantiation.
-# It will be re-initialized inside the loop.
-folds = get_loso_folds(
-    cleaned_df,
-    loso_candidate_files,
-    interictal_val_ratio=0.2, # This ratio is for the global interictal split within folds
-    random_state=42
-)
-
-all_metrics = []
-
-# Define model_params once here, as it will be used to re-initialize the model in each fold
-model_params = {
-    'num_eeg_channels': 22,
-    'num_classes': 2,
-    'image_size': 224, # IMPORTANT: Input size for EEGHybridViT is 224x224
-    # The EEGHybridViT class does not take patch_size, embed_dim, depth, heads, mlp_dim, dropout, classifier_dropout
-    # in its __init__ (these are internal to the pretrained ViT).
-    # Removed these params from model_params for EEGHybridViT.
-}
-
-for fold_idx, (train_df, val_df, held_out_filename_preictal) in enumerate(folds):
-    print(f"\n==============================================")
-    print(f"Starting Training for Fold {fold_idx+1}/{len(folds)}")
-    print(f"Held-out PREICTAL file for Validation/Testing: {held_out_filename_preictal}")
-    print(f"==============================================\n")
+    print("\n--- FINAL FOLD-BY-FOLD METRICS (USING FIXED THRESHOLD) ---")
+    display_cols = ['held_out_file', 'accuracy', 'sensitivity', 'precision', 'f1_score_binary', 'f1_score_macro', 'auc_roc', 'fph']
+    print(results_df[display_cols].to_string(index=False))
     
-    # CRITICAL FIX: Re-initialize the model for each fold
-    # Using EEGHybridViT here
-    current_model_instance = EEGHybridViT(
-        num_eeg_channels=model_params['num_eeg_channels'],
-        num_classes=model_params['num_classes']
-    )
-
-    sanitized_filename = held_out_filename_preictal.replace('.npy', '').replace(':', '_').replace('.edf_stft_112x112', '')
+    print(f"\n\n--- FINAL AGGREGATED RESULTS (Mean) ---")
+    mean_metrics = results_df[display_cols].select_dtypes(include=np.number).mean()
+    print(mean_metrics)
     
-    fold_model_path = os.path.join(
-        "/kaggle/working/patient_models",
-        f"best_model_patient_fold{fold_idx+1}_{sanitized_filename}.pt"
-    )
-    
-    metrics = train_patient_model(
-        train_df=train_df,
-        val_df=val_df,
-        model=current_model_instance,
-        batch_size=8, # Use batch_size 8 from the high-accuracy code
-        num_epochs=100,
-        patience=20, # Use patience 20 from the high-accuracy code
-        lr=1e-4, # Use lr 1e-4 from the high-accuracy code
-        undersample=True,
-        undersample_ratio=1.0, # Consolidate undersample_ratio to 1.0 for 1:1 balance
-        accumulation_steps=1, # No explicit accumulation needed for batch_size 8 with this model
-        model_path=fold_model_path
-    )
-    all_metrics.append(metrics)
-
-# After the loop, `all_metrics` will contain a list of dictionaries, one for each fold.
-df_metrics = pd.DataFrame(all_metrics)
-print("\n--- Aggregated Metrics Across Folds ---")
-print(df_metrics.mean(numeric_only=True))
-print(df_metrics.head()) # Also show head of the final metrics DataFrame
-
-df_metrics.to_csv('/kaggle/working/all_patient_fold_metrics.csv', index=False)
+    results_df.to_csv(RESULTS_SAVE_PATH, index=False)
+    print(f"\nFull results saved to {RESULTS_SAVE_PATH}")
