@@ -42,15 +42,24 @@ Patient-specific epileptic seizure prediction framework that quantifies and mana
 
 EEG_SeizurePrediction/
 │
+
 ├── 📁 GradCAM++ Images/ # Interpretability visualizations
+
 ├── 📁 Similarity_Matrix/ # t-SNE clustering results
+
 ├── 📁 T_SNE/ # Dimensionality reduction outputs
+
 │
 ├── 🐍 EEG_preprocessing.py # STFT pipeline (raw EEG → spectrograms)
+
 ├── 🐍 EEG_annotation.py # Dataset labeling utilities
+
 ├── 🐍 EEG_model_training.py # Patient-specific LOSO training
+
 ├── 🐍 EEG_master_model.py # 512-dim neural fingerprint extraction
+
 ├── 🐍 EEG_TSNE.py # Seizure fingerprinting + validation
+
 ├── 🐍 EEG_GradCAM++.py # Interpretability quantification
 │
 ├── 📄 Leave-One-out per fold validation metrics.docx
